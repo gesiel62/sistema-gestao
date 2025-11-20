@@ -15,11 +15,11 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'troque-esta-chave-para-producao';
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
-// middlewares
+// middlewares básicos
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- inicializa DB executando init.sql uma vez no startup
+// --- inicializa DB ---
 async function runInitSql() {
   try {
     const sql = fs.readFileSync(path.join(__dirname, 'init.sql')).toString();
@@ -47,88 +47,16 @@ async function logAudit(userId, action, tableName = null, oldData = null, newDat
   }
 }
 
-// --- auth middleware ---
-async function authMiddleware(req, res, next) {
-  // rotas abertas: login (/auth/login) e confirmar leitura (/compliance/confirm) e registro externo (/auth/register)
-  const openPaths = [
-    '/auth/login',
-    '/auth/register',
-    '/compliance/confirm'
-  ];
-  if (openPaths.includes(req.path)) return next();
+// ==================================================================
+// 1. ROTAS PÚBLICAS (Não passam pelo Auth Middleware)
+// ==================================================================
 
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token ausente' });
-
-  const token = authHeader.split(' ')[1];
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    // buscar usuário atual (fresh)
-    const { rows } = await db.query('SELECT id, nome, telefone, role, setor_id, status, last_seen FROM users WHERE id = $1', [payload.id]);
-    if (rows.length === 0) return res.status(401).json({ error: 'Usuário não encontrado' });
-    req.user = rows[0];
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Token inválido' });
-  }
-}
-
-// --- compliance middleware (verifica mensagens obrigatórias)
-async function complianceMiddleware(req, res, next) {
-  // não aplicar para login e confirmar leitura (repetição por segurança)
-  const exemptPaths = [
-    '/auth/login',
-    '/auth/register',
-    '/compliance/confirm'
-  ];
-  if (exemptPaths.includes(req.path)) return next();
-
-  // user deve estar definido (authMiddleware executado antes)
-  const user = req.user;
-  if (!user) return res.status(401).json({ error: 'Usuário não autenticado' });
-
-  try {
-    const { rows: obrigatorias } = await db.query('SELECT id FROM compliance_msgs WHERE obrigatoria = true');
-    if (!obrigatorias || obrigatorias.length === 0) return next();
-
-    const ids = obrigatorias.map(r => r.id);
-    // achar mensagens obrigatórias que o usuário NÃO leu
-    const { rows: notRead } = await db.query(
-      `SELECT id FROM compliance_msgs cm
-       WHERE cm.obrigatoria = true
-       AND NOT EXISTS (
-         SELECT 1 FROM user_reads ur WHERE ur.user_id = $1 AND ur.compliance_msg_id = cm.id
-       )`,
-      [user.id]
-    );
-
-    if (notRead.length > 0) {
-      return res.status(403).json({
-        error: 'Você possui mensagens obrigatórias pendentes de leitura. Confirme leitura em /compliance/confirm.'
-      });
-    }
-
-    next();
-  } catch (err) {
-    console.error('Erro complianceMiddleware:', err);
-    res.status(500).json({ error: 'Erro no servidor (compliance check)' });
-  }
-}
-
-// aplicar middlewares globais na ordem:
-// 1) authMiddleware (exceto rotas abertas)
-// 2) complianceMiddleware
-app.use(authMiddleware);
-app.use(complianceMiddleware);
-
-// --- rotas ---
-// rota de status simples
+// Rota de status simples
 app.get('/', (req, res) => {
   res.json({ ok: true, env: process.env.NODE_ENV || 'development' });
 });
 
-// --- Autenticação ---
-// Login com telefone + senha => retorna JWT
+// Login
 app.post('/auth/login', async (req, res) => {
   try {
     const { telefone, password } = req.body;
@@ -156,7 +84,7 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Cadastro Externo: cria usuário com status "pendente"
+// Cadastro Externo
 app.post('/auth/register', async (req, res) => {
   try {
     const { nome, telefone, password, setor_id } = req.body;
@@ -183,19 +111,109 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-// --- Admin routes ---
+// Confirmar leitura (Pode receber token opcionalmente dentro da lógica, mas a rota em si é aberta para evitar loop de bloqueio)
+app.post('/compliance/confirm', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token ausente' });
+    const token = authHeader.split(' ')[1];
+    const payload = jwt.verify(token, JWT_SECRET);
+    const userId = payload.id;
+
+    const { compliance_msg_id } = req.body;
+    if (!compliance_msg_id) return res.status(400).json({ error: 'compliance_msg_id é obrigatório' });
+
+    await db.query(
+      `INSERT INTO user_reads (user_id, compliance_msg_id) VALUES ($1,$2)
+       ON CONFLICT (user_id, compliance_msg_id) DO NOTHING`,
+      [userId, compliance_msg_id]
+    );
+
+    await logAudit(userId, 'confirm_compliance', 'user_reads', null, { user_id: userId, compliance_msg_id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /compliance/confirm erro', err);
+    res.status(500).json({ error: 'Erro no servidor' });
+  }
+});
+
+
+// ==================================================================
+// 2. MIDDLEWARES DE SEGURANÇA (Barreira)
+// ==================================================================
+
+// Auth Middleware
+async function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token ausente' });
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const { rows } = await db.query('SELECT id, nome, telefone, role, setor_id, status, last_seen FROM users WHERE id = $1', [payload.id]);
+    if (rows.length === 0) return res.status(401).json({ error: 'Usuário não encontrado' });
+    req.user = rows[0];
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Token inválido' });
+  }
+}
+
+// Compliance Middleware
+async function complianceMiddleware(req, res, next) {
+  const user = req.user;
+  if (!user) return res.status(401).json({ error: 'Usuário não autenticado' });
+
+  // Admin pode pular verificação se necessário, ou mantemos para todos
+  // if (user.role === 'admin') return next(); 
+
+  try {
+    const { rows: obrigatorias } = await db.query('SELECT id FROM compliance_msgs WHERE obrigatoria = true');
+    if (!obrigatorias || obrigatorias.length === 0) return next();
+
+    const { rows: notRead } = await db.query(
+      `SELECT id FROM compliance_msgs cm
+       WHERE cm.obrigatoria = true
+       AND NOT EXISTS (
+         SELECT 1 FROM user_reads ur WHERE ur.user_id = $1 AND ur.compliance_msg_id = cm.id
+       )`,
+      [user.id]
+    );
+
+    if (notRead.length > 0) {
+      return res.status(403).json({
+        error: 'Você possui mensagens obrigatórias pendentes de leitura.',
+        compliance_pending: true
+      });
+    }
+    next();
+  } catch (err) {
+    console.error('Erro complianceMiddleware:', err);
+    res.status(500).json({ error: 'Erro no servidor (compliance check)' });
+  }
+}
+
+// APLICAR OS MIDDLEWARES DAQUI PARA BAIXO
+app.use(authMiddleware);
+app.use(complianceMiddleware);
+
+
+// ==================================================================
+// 3. ROTAS PROTEGIDAS (Exigem Login)
+// ==================================================================
+
+// Admin helper
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: 'Acesso negado: admin' });
   next();
 }
 
-// Aprovar/Negar cadastro externo (admin)
+// --- Admin ---
 app.post('/admin/approve', requireAdmin, async (req, res) => {
   try {
     const { user_id, approve, motivo } = req.body;
     if (!user_id || typeof approve === 'undefined') return res.status(400).json({ error: 'user_id e approve são obrigatórios' });
 
-    // buscar antigo
     const { rows: oldRows } = await db.query('SELECT * FROM users WHERE id = $1', [user_id]);
     if (oldRows.length === 0) return res.status(404).json({ error: 'Usuário não encontrado' });
 
@@ -205,12 +223,10 @@ app.post('/admin/approve', requireAdmin, async (req, res) => {
 
     res.json({ ok: true, status: newStatus });
   } catch (err) {
-    console.error('POST /admin/approve erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Reset de senha por admin (admin não vê senha; gera novo hash)
 app.post('/admin/reset-password', requireAdmin, async (req, res) => {
   try {
     const { user_id, new_password } = req.body;
@@ -223,95 +239,61 @@ app.post('/admin/reset-password', requireAdmin, async (req, res) => {
     await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user_id]);
     await logAudit(req.user.id, 'reset_password', 'users', oldRows[0], { id: user_id });
 
-    res.json({ ok: true, message: 'Senha resetada pelo admin (admin não vê a senha).' });
+    res.json({ ok: true, message: 'Senha resetada pelo admin.' });
   } catch (err) {
-    console.error('POST /admin/reset-password erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// --- Compliance endpoints ---
-// Criar mensagem de compliance (admin)
 app.post('/compliance', requireAdmin, async (req, res) => {
   try {
     const { texto, obrigatoria } = req.body;
     if (!texto) return res.status(400).json({ error: 'texto é obrigatório' });
-
     const { rows } = await db.query('INSERT INTO compliance_msgs (texto, obrigatoria) VALUES ($1,$2) RETURNING *', [texto, !!obrigatoria]);
     await logAudit(req.user.id, 'create_compliance_msg', 'compliance_msgs', null, rows[0]);
     res.status(201).json(rows[0]);
   } catch (err) {
-    console.error('POST /compliance erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Listar mensagens compliance (qualquer usuário autenticado)
+app.get('/users', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT id, nome, telefone, setor_id, role, status, last_seen, created_at FROM users ORDER BY id DESC');
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro no servidor' });
+  }
+});
+
+// --- Rotas Comuns Protegidas ---
 app.get('/compliance', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT * FROM compliance_msgs ORDER BY created_at DESC');
     res.json(rows);
   } catch (err) {
-    console.error('GET /compliance erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Confirmar leitura (rota aberta) -> grava em user_reads
-app.post('/compliance/confirm', async (req, res) => {
-  try {
-    // precisa autenticar token porque só o usuário pode confirmar; mas instrução inicial disse que confirmar leitura seria exceção do middleware;
-    // aqui aceitamos JWT optional: se vier token, usamos usuário; caso contrário, erro
-    const authHeader = req.headers.authorization || '';
-    if (!authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token ausente' });
-    const token = authHeader.split(' ')[1];
-    const payload = jwt.verify(token, JWT_SECRET);
-    const userId = payload.id;
-
-    const { compliance_msg_id } = req.body;
-    if (!compliance_msg_id) return res.status(400).json({ error: 'compliance_msg_id é obrigatório' });
-
-    // inserir se não existir
-    await db.query(
-      `INSERT INTO user_reads (user_id, compliance_msg_id) VALUES ($1,$2)
-       ON CONFLICT (user_id, compliance_msg_id) DO NOTHING`,
-      [userId, compliance_msg_id]
-    );
-
-    await logAudit(userId, 'confirm_compliance', 'user_reads', null, { user_id: userId, compliance_msg_id });
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('POST /compliance/confirm erro', err);
-    res.status(500).json({ error: 'Erro no servidor' });
-  }
-});
-
-// --- Biolinks CRUD (ex de regras de permissão por setor) ---
-// Lista biolinks
 app.get('/biolinks', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT * FROM biolinks ORDER BY id DESC');
     res.json(rows);
   } catch (err) {
-    console.error('GET /biolinks erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Criar biolink (apenas setores com permissão 'write' podem criar)
 app.post('/biolinks', async (req, res) => {
   try {
     const user = req.user;
     const { titulo, items } = req.body;
-
-    // pegar permissoes do setor
     const { rows: setorRows } = await db.query('SELECT permissoes_json FROM setores WHERE id = $1', [user.setor_id]);
     const permissoes = setorRows[0] ? setorRows[0].permissoes_json : {};
     if (!(permissoes && permissoes.biolink && permissoes.biolink === 'write')) {
       return res.status(403).json({ error: 'Seu setor não tem permissão para criar biolinks' });
     }
-
     const { rows } = await db.query(
       'INSERT INTO biolinks (titulo, items) VALUES ($1,$2) RETURNING *',
       [titulo || null, items ? JSON.stringify(items) : '[]']
@@ -319,22 +301,18 @@ app.post('/biolinks', async (req, res) => {
     await logAudit(user.id, 'create_biolink', 'biolinks', null, rows[0]);
     res.status(201).json(rows[0]);
   } catch (err) {
-    console.error('POST /biolinks erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Atualizar biolink
 app.put('/biolinks/:id', async (req, res) => {
   try {
     const user = req.user;
     const id = req.params.id;
     const { titulo, items } = req.body;
-
     const { rows: oldRows } = await db.query('SELECT * FROM biolinks WHERE id = $1', [id]);
     if (oldRows.length === 0) return res.status(404).json({ error: 'Biolink não encontrado' });
 
-    // permissões
     const { rows: setorRows } = await db.query('SELECT permissoes_json FROM setores WHERE id = $1', [user.setor_id]);
     const permissoes = setorRows[0] ? setorRows[0].permissoes_json : {};
     if (!(permissoes && permissoes.biolink && (permissoes.biolink === 'write' || permissoes.biolink === 'edit'))) {
@@ -348,62 +326,44 @@ app.put('/biolinks/:id', async (req, res) => {
     await logAudit(user.id, 'update_biolink', 'biolinks', oldRows[0], rows[0]);
     res.json(rows[0]);
   } catch (err) {
-    console.error('PUT /biolinks/:id erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Deletar biolink (apenas admin ou setor com write+)
 app.delete('/biolinks/:id', async (req, res) => {
   try {
     const user = req.user;
     const id = req.params.id;
-
     const { rows: oldRows } = await db.query('SELECT * FROM biolinks WHERE id = $1', [id]);
     if (oldRows.length === 0) return res.status(404).json({ error: 'Biolink não encontrado' });
 
-    // permitir se admin
     if (user.role !== 'admin') {
-      // checar permissão no setor
       const { rows: setorRows } = await db.query('SELECT permissoes_json FROM setores WHERE id = $1', [user.setor_id]);
       const permissoes = setorRows[0] ? setorRows[0].permissoes_json : {};
       if (!(permissoes && permissoes.biolink && permissoes.biolink === 'write')) {
         return res.status(403).json({ error: 'Seu setor não tem permissão para deletar biolinks' });
       }
     }
-
     await db.query('DELETE FROM biolinks WHERE id = $1', [id]);
     await logAudit(user.id, 'delete_biolink', 'biolinks', oldRows[0], null);
     res.json({ ok: true });
   } catch (err) {
-    console.error('DELETE /biolinks/:id erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// Exemplo: incrementar contador de cliques (pode ser público)
 app.post('/biolinks/:id/click', async (req, res) => {
+    // Nota: Se você quiser que cliques sejam PUBLICOS (sem login), mova esta rota para a seção 1 (antes do authMiddleware).
+    // Por enquanto, deixei protegida.
   try {
     const id = req.params.id;
     const { rows: oldRows } = await db.query('SELECT * FROM biolinks WHERE id = $1', [id]);
     if (oldRows.length === 0) return res.status(404).json({ error: 'Biolink não encontrado' });
 
     const { rows } = await db.query('UPDATE biolinks SET cliques_count = cliques_count + 1 WHERE id = $1 RETURNING cliques_count', [id]);
-    await logAudit(null, 'click_biolink', 'biolinks', { id, cliques_count: oldRows[0].cliques_count }, { cliques_count: rows[0].cliques_count });
+    await logAudit(req.user.id, 'click_biolink', 'biolinks', { id, cliques_count: oldRows[0].cliques_count }, { cliques_count: rows[0].cliques_count });
     res.json({ ok: true, cliques_count: rows[0].cliques_count });
   } catch (err) {
-    console.error('POST /biolinks/:id/click erro', err);
-    res.status(500).json({ error: 'Erro no servidor' });
-  }
-});
-
-// --- Users: listar (admin) e info próprio ---
-app.get('/users', requireAdmin, async (req, res) => {
-  try {
-    const { rows } = await db.query('SELECT id, nome, telefone, setor_id, role, status, last_seen, created_at FROM users ORDER BY id DESC');
-    res.json(rows);
-  } catch (err) {
-    console.error('GET /users erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
@@ -417,7 +377,6 @@ app.get('/me', async (req, res) => {
   }
 });
 
-// Atualizar perfil (usuário)
 app.put('/me', async (req, res) => {
   try {
     const user = req.user;
@@ -427,12 +386,11 @@ app.put('/me', async (req, res) => {
     await logAudit(user.id, 'update_profile', 'users', oldRows[0], rows[0]);
     res.json(rows[0]);
   } catch (err) {
-    console.error('PUT /me erro', err);
     res.status(500).json({ error: 'Erro no servidor' });
   }
 });
 
-// --- Start server ---
+// --- Start ---
 (async () => {
   await runInitSql();
   app.listen(PORT, () => {
